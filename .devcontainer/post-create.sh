@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# Installation unique à la création du codespace : arduino-cli + cœur AVR (Uno, Nano, Mega).
+# Installation unique à la création du codespace : arduino-cli + cœur AVR (Uno, Nano, Mega)
+# et toolchain ARM (C bare-metal Pico compilé par Kablix via arm-none-eabi-gcc).
 set -euo pipefail
+
+sudo apt-get update
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc-arm-none-eabi libnewlib-arm-none-eabi
 
 mkdir -p "$HOME/.local/bin"
 curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR="$HOME/.local/bin" sh
