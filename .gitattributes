@@ -1,0 +1,2 @@
+# Scripts shell exécutés sous Linux (Codespaces) : fins de ligne LF obligatoires
+*.sh text eol=lf

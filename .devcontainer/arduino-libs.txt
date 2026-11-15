@@ -1,0 +1,15 @@
+# Bibliothèques Arduino installées par post-create.sh (une par ligne, nom du gestionnaire de bibliothèques)
+Adafruit NeoPixel
+LiquidCrystal I2C
+DHT sensor library
+Adafruit Unified Sensor
+Servo
+SD
+OneWire
+DallasTemperature
+Keypad
+Firmata
+DmxSimple
+Adafruit SSD1306
+Adafruit GFX Library
+Adafruit ILI9341
