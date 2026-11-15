@@ -1,5 +1,9 @@
 # testkablix — tests manuels par composant
 
+[![Ouvrir dans GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/FrankSAURET/TestKablix)
+
+Le codespace arrive prêt : Kablix, Arduino VS Code IDE, ColoredTheme, français, MicroPico, Raspberry Pi Pico, Teleplot, arduino-cli (cœur AVR et bibliothèques) et toolchain ARM pour le C Pico. Il faut un compte GitHub ; le temps de calcul est décompté sur le quota de ce compte.
+
 Un test = un programme + un projet `.projix` (schéma câblé prêt à simuler).
 
 - **Sketchs Arduino (`.ino`)** : rangés sous **`Arduino/`**, un dossier par sketch (convention arduino-cli) — `Arduino/<nom>/<nom>.ino` et son `.projix` dans le même dossier.
