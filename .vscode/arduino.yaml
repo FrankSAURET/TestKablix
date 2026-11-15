@@ -1,0 +1,4 @@
+board: arduino:avr:uno
+sketch: Arduino/7seg-uno/7seg-uno.ino
+port: COM3
+output: .build

@@ -1,2 +1,133 @@
-# TestKablix
-Essais pour kablix
+# testkablix — tests manuels par composant
+
+Un test = un programme + un projet `.projix` (schéma câblé prêt à simuler).
+
+- **Sketchs Arduino (`.ino`)** : rangés sous **`Arduino/`**, un dossier par sketch (convention arduino-cli) — `Arduino/<nom>/<nom>.ino` et son `.projix` dans le même dossier.
+- **Scripts MicroPython (`.py`)** : à la racine, le `.projix` porte le même nom.
+- **Cartes Pico 2 / Pico 2 W** : à la racine elles aussi, à côté de leur aîné Pico. Les deux `blink` ont leur propre `.py` ; les autres n'ont **qu'un `.projix`** — ils rejouent le programme de leur aîné (voir « Jumeaux Pico 2 » plus bas).
+
+Aucun script ne code ces emplacements en dur : `_paths.mjs` retrouve un fichier de test où qu'il soit rangé (racine puis sous-dossiers). Déplacer un test ne casse donc ni la génération ni les vérifications.
+
+## Utilisation
+
+1. Ouvrir le simulateur Kablix (icône de la barre d'activité).
+2. `📂 Ouvrir` → choisir le `.projix` du test : le schéma, la carte **et le fichier de code** sont restaurés (le workspace doit être la racine du dépôt pour que la référence au fichier de code se résolve).
+3. `▶ Démarrer` : compile et exécute le programme du test.
+4. Agir sur le composant (curseur, bouton, survol…) et observer le moniteur série.
+
+## Couverture
+
+Chaque carte de dev a son projix : `blink-uno`, `blink-nano`, `blink-mega`, `blink-pico`, `blink-picow`, `blink-pico2`, `blink-pico2w` (LED embarquée). Les deux derniers portent la puce **RP2350** (Cortex-M33) : le code est le même que sur une Pico, seul `machine.freq()` change (150 MHz au lieu de 125).
+
+Chaque composant du catalogue a deux tests : `<composant>-uno` (Arduino, C) et `<composant>-pico` (MicroPython) — sauf le HC-SR04, simulé sur AVR uniquement, et les quelques doublons marqués « (retiré) » dans le tableau, dont le montage n'apprenait rien de plus qu'un autre déjà présent : bouton 6 mm (les deux cartes), résistance seule, servomoteur côté Pico, résistances variables côté Uno. La colonne « Observable » dit par quoi chacun reste couvert.
+
+### Jumeaux Pico 2
+
+Chaque test Pico a son jumeau RP2350, `<nom>-pico2` à côté de lui — même montage, même programme, l'autre puce. Trois choses à savoir avant d'y toucher :
+
+- **Le programme est PARTAGÉ, pas recopié.** Le `.projix` du jumeau référence le `.py` de son aîné (champ `codeFrom` de la spec) : corriger le programme corrige les deux tests, et aucune copie ne peut dériver.
+- **Le montage vient du `.projix` de l'aîné**, pas de la spec — c'est le banc que Frank a redisposé à la main qui fait foi. La Pico 2 étant dessinée en **portrait** (90 × 220) là où la Pico est en paysage (208 × 83), le montage est translaté **en bloc** à droite de la carte : distances, alignements et angles sont conservés.
+- **Les fils sont autoroutés une fois pour toutes.** Les points de passage de l'aîné contournaient une carte paysage ; ils traverseraient la carte portrait. Le tracé de remplacement est calculé par l'autoroutage du vrai éditeur et versionné dans `_routage.json` :
+
+      node scripts/_router-jumeaux-pico2.mjs            (tous les jumeaux) node scripts/_router-jumeaux-pico2.mjs led-pico2  (ceux-là seulement)
+
+  À relancer après tout déplacement de composant dans un banc Pico, sinon les fils du jumeau repartent en diagonale.
+
+Le robot araignée n'a pas de jumeau : sa Pico W est **dans** le châssis, il n'y a pas de carte à remplacer.
+
+| Composant | Test Uno | Test Pico | Test Pico 2 | Observable |
+|---|---|---|---|---|
+| LED (+ résistance) | `led-uno` | `led-pico` | `led-pico2` | clignote 1 Hz |
+| LED RGB | `rgb-led-uno` | `rgb-led-pico` | `rgb-led-pico2` | fondu R, V, B puis blanc |
+| Bouton poussoir | `button-uno` | `button-pico` | `button-pico2` | appui → « APPUYE » + LED |
+| Bouton 6 mm | — (retiré) | — (retiré) | — | couvert par `npm run verify:button-latch`, qui éprouve les DEUX poussoirs (souris, clavier, capuchon enfoncé, maintien Ctrl) |
+| Résistance | — (retiré) | — | — | en série dans la moitié des autres montages |
+| Résistances de puissance | `resistance-puissance-uno` | `resistance-puissance-pico` | `resistance-puissance-pico2` | les deux boîtiers 10 W en direct sur une alim de labo 12 V : celui de 4,7 Ω dissipe 30 W et part en fumée, l'autre tient (une sortie de carte, avec ses ~25 Ω, ne peut pas en griller une) |
+| Diode | `diode-uno` | `diode-pico` | `diode-pico2` | passante / à l'envers = bloquée |
+| Condensateurs | `condo-uno` | `condo-pico` | `condo-pico2` | 3 branches RC en parallèle (film 0,1 s, tantale 0,33 s, chimique 1 s) lues sur 3 ADC |
+| Transistor (sélecteur) | `transistor-uno` | `transistor-pico` | `transistor-pico2` | Une branche par famille — BC547 vs 2N3904 (à montage égal, le gain décide), BC557 (PNP) côté haut, BC517 (darlington) sur 100 kΩ, BS170 (MOSFET) grille directe |
+| Transistor PN2222A | `pn2222a-uno` | `pn2222a-pico` | `pn2222a-pico2` | saturé = ventilateur tourne |
+| Transistor NPN (proto) | `npn-uno` | `npn-pico` | `npn-pico2` | commande côté bas d'une LED |
+| Transistor PNP (proto) | `pnp-uno` | `pnp-pico` | `pnp-pico2` | commande côté haut (logique inversée) |
+| Relais OMRON G5V | `relais-uno` | `relais-pico` | `relais-pico2` | seul le relais bien câblé colle |
+| Batterie externe (Power bank) | `powerbank-uno` | `powerbank-pico` | `powerbank-pico2` | alimente un PCA9685 + servo, LED de jauge suivant la charge |
+| Consommation et batterie | `consommation-uno` | `consommation-pico` | — | la batterie (1 mAh) alimente la carte, qui alterne 2 s éveillée et 2 s en veille profonde ; traceur : courant de la carte, charge et autonomie ; vide, la carte s'éteint |
+| Pile 4 × AA | `pile-4aa-uno` | `pile-4aa-pico` | — | `.kompix` ; Uno : 6,4 V sur VIN, démarre puis s'éteint sous 6,2 V (1 mAh) ; Pico : 6,4 V sur VSYS, **refus de démarrer** |
+| Pile 9 V | `pile-9v-uno` | `pile-9v-pico` | — | `.kompix` ; Uno : 9,5 V sur VIN, tourne jusqu'à 6,2 V (1 mAh) ; Pico : 9,5 V sur VSYS, **refus de démarrer** |
+| Pile CR2032 | `pile-cr2032-uno` | `pile-cr2032-pico` | — | `.kompix` ; Uno : 3 V sur 5V, **refus de démarrer** ; Pico : 3 V sur VSYS, tourne jusqu'à pile vide (1 mAh) |
+| Batterie LiPo 1S | `batterie-lipo-uno` | `batterie-lipo-pico` | — | `.kompix` ; Uno : 4,2 V sur VIN, **refus de démarrer** ; Pico : 4,2 V sur VSYS, tourne jusqu'à batterie vide (1 mAh) |
+| Autonomie (scénario) | `autonomie-uno` | `autonomie-pico` | — | `.kompix` ; nœud de mesure 1 s éveillé / 4 s d'attente, constante `VEILLE` (veille profonde ou attente éveillée) ; Uno sur 9 V (VIN), Pico sur LiPo (VSYS) ; protocole complet dans [scenario-piles.md](scenario-piles.md) |
+| Patte d'araignée (placeholder) | `patte-uno` | `patte-pico` | `patte-pico2` | 2 articulations (coxa, patella) sur 2 canaux PCA9685 indépendants |
+| Robot araignée | — | `araignee-pico` | — | Robot SEUL, sans un fil : il porte sa Pico W (carte `picow`) et son PCA9685 à 0x7F pilote ses 8 articulations. Pas de test Arduino — le robot EST la carte |
+| Buzzer | `buzzer-uno` | `buzzer-pico` | `buzzer-pico2` | halo actif + tone/PWM |
+| Potentiomètre | `pot-uno` | `pot-pico` | `pot-pico2` | valeur suit le curseur |
+| Potentiomètre à glissière | `slide-pot-uno` | `slide-pot-pico` | `slide-pot-pico2` | idem |
+| Potentiomètre ajustable | `pot-rot2-uno` | `pot-rot2-pico` | `pot-rot2-pico2` | vis tournée à la souris ; boîtier de 100 kΩ, donc « 104 » écrit dessus |
+| Afficheur 7 segments | `7seg-uno` | `7seg-pico` | `7seg-pico2` | compte 0→9 |
+| Barre de 10 LED | `led-bar-uno` | `led-bar-pico` | `led-bar-pico2` | vumètre monte/descend |
+| Interrupteur à glissière | `slide-switch-uno` | `slide-switch-pico` | `slide-switch-pico2` | position 1/3 |
+| DIP switch ×8 | `dip-switch-uno` | `dip-switch-pico` | `dip-switch-pico2` | 8 canaux 0/1 |
+| Joystick analogique | `joystick-uno` | `joystick-pico` | `joystick-pico2` | X/Y + bouton |
+| Capteur de lumière (LDR) | `photoresistor-uno` | `photoresistor-pico` | `photoresistor-pico2` | AO + DO (actif bas) |
+| Lecteur RFID Grove 125 kHz | `grove-rfid-uno` | `grove-rfid-pico` | `grove-rfid-pico2` | composant de la bibliothèque publique (`.kompix`) ; c'est le composant qui PARLE au micro : tant que le badge est dans la boucle, il redit son numéro une fois par seconde. Le cavalier choisit la langue — l'Uno l'écoute en **UART** (numéro en clair sur `Tx`, 9600 bauds, liaison série logicielle sur D2), la Pico en **Wiegand** (26 impulsions de 50 µs sur deux fils, `Tx` = DATA0 sur GP16 et `Rx` = DATA1 sur GP17, lues par interruption) |
+| Capteur PIR | `pir-uno` | `pir-pico` | `pir-pico2` | survol = mouvement |
+| Capteur d'inclinaison | `tilt-uno` | `tilt-pico` | `tilt-pico2` | clic maintenu = incliné |
+| Capteur à effet Hall | `hall-uno` | `hall-pico` | `hall-pico2` | aimant glissé = sortie basse ; rappel externe 10 kΩ (Uno) ou interne (Pico) |
+| Servomoteur | `servo-uno` | — (retiré) | — | 0° / 90° / 180° ; côté Pico, 16 servos et leur alim sont éprouvés par `powerbank-pico` et `patte-pico` |
+| LCD 16×2 I²C | `lcd-uno` | `lcd-pico` | `lcd-pico2` | texte + compteur |
+| OLED SSD1306 I²C | `oled-ssd1306-uno` | `oled-ssd1306-pico` | `oled-ssd1306-pico2` | cadre + dessin |
+| TFT ILI9341 SPI | `ili9341-uno` | `ili9341-pico` | `ili9341-pico2` | aplats de couleur |
+| Carte microSD SPI | `microsd-uno` | `microsd-pico` | `microsd-pico2` | init OK (pas de FAT) |
+| NeoPixel (1 px) | `neopixel-uno` | `neopixel-pico` | `neopixel-pico2` | rouge/vert/bleu |
+| Matrice NeoPixel 8×8 | `neopixel-matrix-uno` | `neopixel-matrix-pico` | `neopixel-matrix-pico2` | diagonale + dégradé |
+| Anneau NeoPixel 16 | `led-ring-uno` | `led-ring-pico` | `led-ring-pico2` | chenillard bleu |
+| Ruban de LED en spirale (30 LED, un fil) | `led-strip-uno` | `led-strip-pico` | `led-strip-pico2` | chenillard vert |
+| Ruban de LED APA102 (SPI, 30 LED) | `led-strip-apa102-uno` | `led-strip-apa102-pico` | `led-strip-apa102-pico2` | chenillard vert ; décodé sur le bus SPI matériel |
+| Ruban de LED WS2801 (SPI, 30 LED, RVB) | `led-strip-ws2801-uno` | `led-strip-ws2801-pico` | `led-strip-ws2801-pico2` | chenillard vert ; pause d'horloge 600 µs |
+| Température NTC | `ntc-temp-uno` | `ntc-temp-pico` | `ntc-temp-pico2` | valeur suit le curseur |
+| Résistances variables LDR + CTN + CTP | — (retiré) | `rv-pico` | `rv-pico2` | trois ponts diviseurs lus d'un coup ; éclairer la LDR ou chauffer la CTN fait monter la lecture, chauffer la CTP la fait descendre |
+| Phototransistor | `phototransistor-uno` | `phototransistor-pico` | `phototransistor-pico2` | pont diviseur avec 1 kΩ en bas, la lecture MONTE avec la lumière (50 % au repos à 1 mW/cm², 83 % curseur à fond) ; la résistance est obligatoire, Kablix signale le montage sans elle |
+| Photodiode | `photodiode-uno` | `photodiode-pico` | `photodiode-pico2` | même pont, mais 100 kΩ en bas : la photodiode laisse passer cent fois moins de courant (50 % au repos à 1 mW/cm², 83 % curseur à fond) ; cathode vers le plus, résistance obligatoire |
+| Multimètre | `multimetre-uno` | `multimetre-pico` | `multimetre-pico2` | les deux emplois du même appareil sur la même planche : M1 VOLTMÈTRE en parallèle sur un pont 1 kΩ / 1 kΩ piloté par une broche, M2 AMPÈREMÈTRE en série dans une branche alim → 1 kΩ → masse (≈ 2,46 V et 4,99 mA sur Uno, ≈ 1,63 V et 3,29 mA sur Pico) |
+| Oscilloscope | `oscillo-uno` | `oscillo-pico` | `oscillo-pico2` | M1 EN PARALLÈLE sur le bas d'un pont 1 kΩ / 1 kΩ piloté par une broche qui bascule toutes les 500 ms : créneau 0 V / ≈ 2,46 V (Uno) ou 0 V / ≈ 1,63 V (Pico), calibres de départ 1 V et 0,5 s par carreau — une période tient en deux carreaux |
+| Générateur BF | `gbf-uno` | `gbf-pico` | — | l'appareil qui sort un SIGNAL et non une tension fixe, Vs sur l'entrée analogique et masse commune. Côté Uno un SINUS de 10 Hz calé sur toute la plage (2,5 V de crête sur 2,5 V de décalage = 0 à 5 V pile) ; côté Pico un TRIANGLE de 20 Hz à 30 % de rapport cyclique (montée courte, descente longue — la déformation que le sinus ne montre pas), réglé à 0,15–3,15 V pour ne pas écrêter sur une entrée 3,3 V. Les quatre boutons et le curseur de forme se règlent à la souris en simulation |
+| Analyseur logique (sonde) | `sonde-logique-uno` | `sonde-logique-pico` | — | quatre pinces POSÉES sur des pastilles de la carte (aucun fil : l'attribut `accroche` retient la broche recouverte), et les quatre cas que rencontre l'élève : SD1 sur une broche qui bat vite (étiquetée « horloge »), SD2 sur une broche deux fois plus lente (sans étiquette, elle prend le nom de la broche), SD3 sur une masse (niveau constant, l'analyseur explique qu'il n'y a aucun front), SD4 sur une entrée analogique — tracée quand même, mais signalée : on ne verra que 0 ou 1 |
+| Analyseur logique + UART | `uart-uno` | `uart-pico` | `uart-pico2` | deux liaisons série à deux vitesses, une pince POSÉE sur chaque broche d'émission : sur l'Uno, `Serial` à 9600 bauds sur D1 (aussi dans le moniteur série) et une `SoftwareSerial` à 4800 bauds sur D3 ; sur la Pico, UART0 à 9600 bauds sur GP0 et UART1 à 4800 bauds sur GP4. Le projet s'ouvre avec les deux décodages UART déjà réglés (champ `analyseur` de la spec) : les octets s'écrivent sous les créneaux, la case **Bits** montre chaque bit |
+| Banc de mesure (5 montages) | `mesure-uno` | `mesure-pico` | — | cinq montages sur UNE planche, six appareils qui mesurent en même temps : moteur haché en PWM par un PN2222A (M1 voltmètre à ses bornes, M2 ampèremètre en série, O1 oscilloscope sur la base), ventilateur sur l'alim (M3), bobine de relais (M4), potentiomètre en pont (M5). À 50 % de rapport cyclique M1 et M2 affichent la MOITIÉ (2,30 V et 40 mA) alors que O1 garde toute la hauteur du créneau : le multimètre moyenne, l'oscilloscope montre |
+| Variateur PNP (côté haut) | `variateur-pnp-uno` | `variateur-pnp-pico` | — | le même variateur, mais le transistor est un PNP entre le + et le moteur : la commande est INVERSÉE, 0 % de rapport cyclique = plein régime et 100 % = arrêt. À 25 % de temps haut le PNP conduit les 75 % restants, M1 lit 3,6 V et M2 72 mA. C'est le montage que le lot .57 laissait découvert : une broche hachée y est active au niveau BAS |
+| Capteur de gaz (MQ) | `gas-sensor-uno` | `gas-sensor-pico` | `gas-sensor-pico2` | AOUT + DOUT |
+| Capteur de pouls | `heartbeat-uno` | `heartbeat-pico` | `heartbeat-pico2` | signal qui bat |
+| Capteur de flamme | `flame-uno` | `flame-pico` | `flame-pico2` | AOUT + DOUT |
+| Capteur de son | `sound-uno` | `sound-pico` | `sound-pico2` | AOUT + DOUT |
+| HC-SR04 (ultrason) | `hcsr04-uno` | — (AVR seulement) | — | distance en cm |
+| Ventilateur | `ventilo-uno` | `ventilo-pico` | `ventilo-pico2` | tourne sur l'alim, cale sur une broche |
+| Moteur à courant continu | `moteur-dc-uno` | `moteur-dc-pico` | `moteur-dc-pico2` | tourne avec sa diode, cale sur une broche, transistor détruit sans roue libre |
+| DHT22 (temp/humidité) | `dht22-uno` | `dht22-pico` | `dht22-pico2` | T + H toutes les 2 s |
+| DHT11 (temp/humidité) | `dht11-uno` | `dht11-pico` | `dht11-pico2` | valeurs entières, 1 lecture/s |
+| DS18B20 (température) | `ds18b20-uno` | `ds18b20-pico` | `ds18b20-pico2` | composant de la bibliothèque publique (`.kompix`) ; vrai 1-Wire Dallas : sur l'Uno, DEUX capteurs (TO-92 + sonde étanche) sur le même fil, chacun à son adresse ; rappel 4,7 kΩ obligatoire ; curseur de température de −55 à +125 °C |
+| Clavier matriciel 4×4 | `keypad-uno` | `keypad-pico` | `keypad-pico2` | touche affichée |
+| CI logiques : ET et OU | `CI1-uno` | `CI1-pico` | `CI1-pico2` | CD4081/74HC08 et CD4071/74HC32, deux entrées communes, table de vérité comparée porte par porte |
+| CI logiques : OU EXCLUSIF et NON-ET | `CI2-uno` | `CI2-pico` | `CI2-pico2` | CD4070/74HC86 et CD4011/74HC00, même principe |
+| CI logiques : NON-OU et NON | `CI3-uno` | `CI3-pico` | `CI3-pico2` | CD4001/74HC02 et CD40106/74HC14 (inverseurs six portes) |
+| DMX512 : carte Grove + projecteur PAR 38 | `dmx-uno` | `dmx-pico` | `dmx-pico2` | les deux composants de la bibliothèque publique (`.kompix`) ; le projecteur prend rouge, vert puis bleu — liaison simulée (broche, adresse, canaux) et continuité du câblage UART → XLR contrôlées |
+| Barrière optique infrarouge | `ir-barrier-uno` | `ir-barrier-pico` | `ir-barrier-pico2` | composant de la bibliothèque publique (`.kompix`) ; obstacle levé = faisceau coupé = sortie à 1, faisceau libre = sortie à 0 ; sortie à collecteur ouvert, rappel externe 10 kΩ (Uno) ou interne (Pico) ; les DEUX boîtiers doivent être alimentés |
+| Capteur d'humidité du sol | `soil-moisture-sensor-uno` | `soil-moisture-sensor-pico` | `soil-moisture-sensor-pico2` | composant de la bibliothèque publique (`.kompix`) ; sortie ANALOGIQUE qui monte avec l'humidité, donc sur A0 / GP26 (ADC0) et jamais sur une broche tout-ou-rien ; en simulation, curseur de 0 à 100 % (0 % = 0 V, 100 % = tension de la carte) |
+| Capteur de lumière Grove | `grove-light-sensor-uno` | `grove-light-sensor-pico` | `grove-light-sensor-pico2` | composant de la bibliothèque publique (`.kompix`) ; prise Grove à quatre fils dont `NC`, qui n'est câblé nulle part ; sortie ANALOGIQUE qui monte avec la lumière, sur A1 / GP27 (ADC1) ; en simulation, curseur de 0 lx à la **pleine échelle** réglée dans l'inspecteur (500 lx par défaut) — changer cette propriété change la course du curseur |
+| Capteur de température LM35A (Béta) | `lm35a-uno` | `lm35a-pico` | `lm35a-pico2` | composant de la bibliothèque publique (`.kompix`), TO-92 à trois pattes `Vs` / `Vout` / `GND` ; sortie ANALOGIQUE de 10 mV par °C, sur A0 / GP27 (ADC1) ; il veut 4 V au moins : 5 V sur l'Uno, **VSYS** (pas 3V3) sur la Pico ; en simulation, curseur de −55 à +150 °C, sortie coupée à 0 V (pas de tension négative, donc pas de montage Vs / −Vs) |
+| Régulateur L78SxxCV (Béta) | `78xx-uno` | `78xx-pico` | `78xx-pico2` | composant de la bibliothèque publique (`.kompix`), TO-220 `IN` / `GND` / `OUT` ; alimenté par une pile 9 V (9,5 V), réglé sur 5 V : la sortie va sur A0 (Uno) ou, par un pont 20 kΩ / 10 kΩ, sur GP27 (Pico) ; marge de 2 V et effondrement au-delà du courant max à essayer dans l'inspecteur |
+| Grove Shield (Uno) | `grove-uno` | — (Uno seulement) | — | composant de la bibliothèque publique (`.kompix`) ; la carte fille posée SUR l'Uno ne simule rien, elle remplace des fils : les 31 fils d'emboîtement que l'éditeur pose tout seul, LED sur la prise D4 (patte 4), bouton sur la prise D2 (patte 2), afficheur LCD sur une prise I²C (A4/A5) ; continuité ET séparation des nets contrôlées, dont le rail 3,3 V laissé à part quand l'interrupteur est sur 5 V |
+| Wi-Fi : point d'accès + serveur web | — (Pico W seulement) | `wifi-picow` | `wifi-pico2w` | la carte se déclare en point d'accès et sert une page ALLUMER/ÉTEINDRE ; un téléphone du même réseau pilote la LED de GP15. La puce Wi-Fi n'étant pas émulée, c'est l'hôte VS Code qui tient la vraie prise TCP (`src/netserver.ts`) — le programme, lui, est celui d'une vraie Pico W |
+
+Libs Arduino requises (installées via `arduino-cli lib install`) : Servo, LiquidCrystal I2C, Adafruit SSD1306, Adafruit ILI9341, Adafruit NeoPixel, SD, DHT sensor library, Keypad.
+
+## Maintenance et vérification automatique
+
+- `_spec.mjs` — **source de vérité** : schémas, câblages, programmes, attentes.
+- `_paths.mjs` — où trouver un test. La lecture cherche le fichier là où il est, l'écriture conserve son emplacement actuel (un test nouveau naît sous `Arduino/` s'il est en `.ino`, à la racine s'il est en `.py`).
+- `_generate.mjs` — régénère tous les fichiers : `node testkablix/_generate.mjs`. Ne pas retoucher les `.ino`/`.py`/`.projix` à la main : modifier la spec puis régénérer.
+- `transistor.csv` — la liste de références de Frank (limites, boîtier, symbole interne, brochage), lue par `npm run verify:transistor` pour contrôler la base des modèles. Donnée de banc : elle vit ici, pas dans un dossier de tri.
+- `_verify.mjs` — vérifie tout : `node testkablix/_verify.mjs` (ou `--quick` pour sauter compilations et exécutions) :
+  1. chaque `.projix` (archive, manifeste, composants, broches, bindings du moteur) ;
+  2. compilation réelle de chaque `.ino` (arduino-cli) ;
+  3. syntaxe de chaque `.py` (`python -m py_compile`) ;
+  4. bout en bout : blink Uno/Mega dans avr8js, LED Pico dans PicoEngine avec le vrai firmware MicroPython.

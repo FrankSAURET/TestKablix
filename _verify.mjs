@@ -1,0 +1,945 @@
+// Vérifie l'intégralité de testkablix/ :
+//   1. chaque .projix : archive valide, manifeste cohérent, composants connus,
+//      extrémités de fils valides, et câblage résolu par le moteur (bindings
+//      de src/webview/diagram/model.mts — mêmes fonctions que la simulation) ;
+//   2. chaque .ino : compilation réelle via arduino-cli (src/compiler.ts) ;
+//   3. chaque .py : compilation syntaxique via python -m py_compile ;
+//   4. bout en bout : blink-uno et blink-mega exécutés dans avr8js (LED D13),
+//      led-pico.py exécuté dans PicoEngine avec le vrai firmware MicroPython.
+//   node testkablix/_verify.mjs [--quick] [nom…]
+//   --quick : saute compilations + bout en bout ; les noms limitent le contrôle
+//   aux tests cités (les .projix du dépôt ne sont pas tous régénérés).
+import esbuild from 'esbuild';
+import JSZip from 'jszip';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { HERE, testCode, testProjix, tk } from './_paths.mjs';
+import { TESTS as ALL_TESTS, PART_PINS } from './_spec.mjs';
+import { firmwarePico } from '../scripts/_firmware.mjs';
+
+const ROOT = join(HERE, '..');
+const QUICK = process.argv.includes('--quick');
+// Noms passés en argument : ne contrôler que ces tests-là.
+const ONLY = new Set(process.argv.slice(2).filter((a) => !a.startsWith('--')));
+const tmp = mkdtempSync(join(tmpdir(), 'kx-testkablix-'));
+
+let failures = 0;
+let checks = 0;
+function check(label, ok, detail = '') {
+  checks++;
+  if (!ok) {
+    failures++;
+    console.log(`  ✗ ${label}${detail ? ` — ${detail}` : ''}`);
+  }
+}
+
+async function bundle(entry, name) {
+  const out = join(tmp, name);
+  await esbuild.build({
+    entryPoints: [join(ROOT, entry)],
+    outfile: out, bundle: true, platform: 'node', format: 'esm', logLevel: 'silent',
+  });
+  return import(pathToFileURL(out).href);
+}
+
+const TESTS = ONLY.size > 0 ? ALL_TESTS.filter((t) => ONLY.has(t.name)) : ALL_TESTS;
+
+/**
+ * Modèle ET catalogue dans le MÊME bundle. Deux bundles séparés emportaient
+ * chacun leur copie du catalogue : un composant de bibliothèque enregistré dans
+ * l'un restait inconnu de l'autre, et `buildNets` (qui appelle `partDef`) levait
+ * « type inconnu » sur un schéma pourtant valide.
+ */
+async function bundleDiagram() {
+  const out = join(tmp, 'diagram.mjs');
+  await esbuild.build({
+    stdin: {
+      contents: "export * as model from './src/webview/diagram/model.mts';\n"
+        + "export * as catalog from './src/webview/diagram/catalog.mjs';\n"
+        + "export * as conso from './src/webview/consommation.mts';\n",
+      resolveDir: ROOT,
+      loader: 'ts',
+    },
+    outfile: out, bundle: true, platform: 'node', format: 'esm', logLevel: 'silent',
+  });
+  return import(pathToFileURL(out).href);
+}
+
+const { model, catalog, conso } = await bundleDiagram();
+
+/**
+ * Point fixe des ponts commandés (transistor saturé, contact de relais fermé) :
+ * un pont ferme un circuit, ce qui change des niveaux, donc l'état des autres
+ * ponts. Même boucle que sim.mts — trois tours suffisent largement.
+ */
+function resolveBridges(diagram, read, vcc, duty) {
+  model.setActiveBridges([]);
+  let signature = model.bridgeSignature([]);
+  for (let pass = 0; pass < 3; pass++) {
+    const list = model.commandedBridges(diagram, read, vcc, undefined, undefined, duty);
+    const next = model.bridgeSignature(list);
+    model.setActiveBridges(list);
+    if (next === signature) break;
+    signature = next;
+  }
+}
+
+/**
+ * Même point fixe, ponts ET portes logiques ensemble : la sortie d'un circuit
+ * intégré impose son niveau à son réseau comme le ferait une broche de sortie,
+ * elle change donc ce que lisent les autres portes. Copie de sim.mts.
+ * Renvoie l'état des boîtiers du dernier tour.
+ */
+function resolveLogic(diagram, read, vcc) {
+  model.setActiveBridges([]);
+  model.setGateDrives([]);
+  let states = [];
+  let signature = `${model.bridgeSignature([])}#${model.gateDriveSignature([])}`;
+  for (let pass = 0; pass < 3; pass++) {
+    const list = model.commandedBridges(diagram, read, vcc);
+    states = model.logicIcStates(diagram, read, vcc);
+    const drives = model.logicIcDrives(states);
+    const next = `${model.bridgeSignature(list)}#${model.gateDriveSignature(drives)}`;
+    model.setActiveBridges(list);
+    model.setGateDrives(drives);
+    if (next === signature) break;
+    signature = next;
+  }
+  return states;
+}
+
+/**
+ * Continuité du câblage : chaque groupe doit former UNE équipotentielle, et deux
+ * groupes différents ne doivent jamais se rejoindre — c'est exactement ce qu'un
+ * court-circuit de dessin ferait. Plusieurs attentes s'en servent après leurs
+ * propres contrôles.
+ */
+function checkNets(t, diagram, groupes) {
+  const netDe = (ep) => {
+    const [partId, pin] = ep.split('/');
+    return model.buildNets(diagram).netOf({ partId, pin });
+  };
+  const vus = new Map();
+  for (const groupe of groupes ?? []) {
+    const nets = groupe.map(netDe);
+    check(`${t.name} : ${groupe.join(' = ')}`, nets.every((n) => n === nets[0]),
+      JSON.stringify(nets));
+    const autre = vus.get(nets[0]);
+    check(`${t.name} : ${groupe[0]} séparé de ${autre ?? ''}`, autre === undefined, 'nets confondus');
+    vus.set(nets[0], groupe[0]);
+  }
+}
+
+// --- 1. Validation des .projix ------------------------------------------------
+console.log(`--- Validation des ${TESTS.length} .projix (structure + câblage) ---`);
+for (const t of TESTS) {
+  const file = testProjix(t);
+  let diagram;
+  try {
+    const zip = await JSZip.loadAsync(readFileSync(file));
+    const manifest = JSON.parse(await zip.file('kablix.json').async('string'));
+    diagram = JSON.parse(await zip.file('diagram.json').async('string'));
+    check(`${t.name} : manifeste`, manifest.format === 'projix' && manifest.board === t.board,
+      `format=${manifest.format} board=${manifest.board}`);
+    // Le codeFile doit MENER quelque part : un chemin mort ouvre un projet
+    // sans programme, sans que rien ne le signale (deux bancs Pico 2 pointaient
+    // encore `testkablix/pico2/` après le rangement). Résolu comme le fait
+    // l'extension : dossier du .projix, puis racine du dépôt, puis nom seul.
+    const ref = manifest.codeFile;
+    check(`${t.name} : codeFile`, typeof ref === 'string' && ref.length > 0);
+    if (typeof ref === 'string' && ref.length > 0) {
+      const dossier = dirname(file);
+      const candidats = [join(dossier, ref), join(ROOT, ref), join(dossier, ref.split('/').pop())];
+      check(`${t.name} : codeFile existe`, candidats.some(existsSync), ref);
+    }
+    // Réglages de l'analyseur prévus par la spec : le projet doit s'ouvrir
+    // avec eux (un décodage perdu = une trame muette à l'écran).
+    if (t.analyseur) {
+      check(`${t.name} : réglages de l'analyseur`,
+        JSON.stringify(manifest.analyseur) === JSON.stringify(t.analyseur),
+        `.projix=${JSON.stringify(manifest.analyseur)}`);
+    }
+  } catch (err) {
+    check(`${t.name} : archive lisible`, false, String(err));
+    continue;
+  }
+
+  // Composants de bibliothèque embarqués dans le projet : les enregistrer au
+  // catalogue AVANT les contrôles, comme le fait la webview à l'ouverture —
+  // sinon un composant .kompix parfaitement valide passerait pour inconnu.
+  for (const cp of diagram.customParts ?? []) {
+    try {
+      catalog.registerCustomPart(cp);
+    } catch (err) {
+      check(`${t.name} : composant embarqué ${cp?.type}`, false, String(err));
+    }
+  }
+
+  // Composants connus du catalogue.
+  for (const p of diagram.parts) {
+    try {
+      catalog.partDef(p.type);
+    } catch {
+      check(`${t.name} : type ${p.type}`, false, 'type inconnu du catalogue');
+    }
+  }
+
+  // Le .projix livré doit DIRE CE QUE DIT LA SPEC — pour ce qui SIMULE.
+  //
+  // `_generate.mjs` recopie `test.parts` tel quel : les deux sont censés
+  // coïncider. Rien ne le vérifiait, et un .projix retouché à la main pouvait
+  // s'éloigner de sa spec sans qu'aucun banc ne bronche — c'est ce qui est
+  // arrivé au lot .98, où SD4 de sonde-logique-pico a changé d'accroche
+  // (U1/GP26 → R1/1) en contradiction avec son propre `expect` (« pin: GP26 »),
+  // et est passé vert pendant un lot entier.
+  //
+  // On contrôle donc la présence, le type et les ATTRIBUTS : ce sont eux qui
+  // décident du comportement simulé (`accroche`, `value`, `color`…), et une
+  // divergence y est toujours un défaut.
+  //
+  // La GÉOMÉTRIE, elle, n'est contrôlée que pour les tests listés dans
+  // GEOMETRIE_A_JOUR. Les planches ont été retouchées à la souris pendant des
+  // mois sans report dans la spec : exiger la position partout lèverait ~470
+  // échecs d'un coup, tous connus et sans effet sur la simulation, et un banc
+  // qui crie autant ne protège plus rien. Un test dont la spec est remise
+  // d'aplomb s'ajoute à la liste, et il est alors tenu au pixel.
+  {
+    const GEOMETRIE_A_JOUR = new Set(['sonde-logique-pico', 'uart-uno', 'uart-pico']);
+    const vu = new Map(diagram.parts.map((p) => [p.id, p]));
+    for (const attendu of t.parts) {
+      const p = vu.get(attendu.id);
+      if (!p) {
+        check(`${t.name} : ${attendu.id} présent dans le .projix`, false, 'absent — régénérer ce test');
+        continue;
+      }
+      check(`${t.name} : ${attendu.id} de type ${attendu.type}`, p.type === attendu.type, `.projix=${p.type}`);
+      for (const [cle, valeur] of Object.entries(attendu.attrs ?? {})) {
+        check(`${t.name} : ${attendu.id}.${cle}`, String((p.attrs ?? {})[cle]) === String(valeur),
+          `.projix=${(p.attrs ?? {})[cle]} spec=${valeur}`);
+      }
+      if (!GEOMETRIE_A_JOUR.has(t.name)) continue;
+      // Une valeur absente vaut 0 ou false des DEUX côtés, sinon `rotation: 90`
+      // côté spec ne se compare pas à l'`undefined` côté fichier. Tolérance
+      // d'un dixième de carreau : un glissé souris laisse des décimales
+      // (490.0089 pour 490.0085) qui ne déplacent rien de visible.
+      const pres = (a, b) => Math.abs((a ?? 0) - (b ?? 0)) < 1;
+      const geo = (o) => `${o.x ?? 0},${o.y ?? 0} rot=${o.rotation ?? 0}${o.flipH ? ' H' : ''}${o.flipV ? ' V' : ''}`;
+      check(`${t.name} : ${attendu.id} posé comme la spec le dit`,
+        pres(p.x, attendu.x) && pres(p.y, attendu.y) && (p.rotation ?? 0) === (attendu.rotation ?? 0)
+        && !!p.flipH === !!attendu.flipH && !!p.flipV === !!attendu.flipV,
+        `.projix=${geo(p)} spec=${geo(attendu)}`);
+    }
+  }
+
+  // Extrémités de fils : composant existant + broche valide.
+  const partById = new Map(diagram.parts.map((p) => [p.id, p]));
+  const mcuPinSet = new Set(catalog.mcuPins(t.board));
+  for (const wire of diagram.wires) {
+    for (const ep of [wire.a, wire.b]) {
+      const part = partById.get(ep.partId);
+      if (!part) {
+        check(`${t.name} : fil ${wire.id}`, false, `composant ${ep.partId} absent`);
+        continue;
+      }
+      const def = catalog.partDef(part.type);
+      const valid = def.kind === 'mcu'
+        ? mcuPinSet.has(ep.pin)
+        : (PART_PINS[part.type] ?? []).includes(ep.pin);
+      check(`${t.name} : fil ${wire.id} → ${part.type}/${ep.pin}`, valid, 'broche inconnue');
+    }
+  }
+
+  // Câblage résolu comme le ferait la simulation (bindings du modèle).
+  // Un .projix désynchronisé (ré-enregistré depuis l'éditeur : les id des
+  // composants y sont renumérotés) fait lever le modèle — c'est un ÉCHEC de ce
+  // test, pas une raison d'interrompre le banc et de masquer les suivants.
+  const e = t.expect;
+  try {
+    switch (e.kind) {
+      case 'board-only':
+        check(`${t.name} : carte seule`, diagram.parts.length === 1 && diagram.parts[0].type === t.board);
+        break;
+      case 'led':
+        check(`${t.name} : LED pilotée par ${e.mcuPin}`, model.ledMcuPin(diagram, e.partId) === e.mcuPin,
+          `résolu=${model.ledMcuPin(diagram, e.partId)}`);
+        break;
+      case 'rgb-led': {
+        const [b] = model.rgbLedBindings(diagram);
+        check(`${t.name} : canaux R/G/B`, b && b.r === e.r && b.g === e.g && b.b === e.b, JSON.stringify(b));
+        break;
+      }
+      case 'button': {
+        const b = model.buttonBindings(diagram).find((x) => x.partId === e.partId);
+        check(`${t.name} : bouton → ${e.mcuPin}`, b?.mcuPin === e.mcuPin, JSON.stringify(b));
+        break;
+      }
+      case 'buzzer': {
+        const b = model.buzzerBindings(diagram).find((x) => x.partId === e.partId);
+        check(`${t.name} : buzzer → ${e.mcuPin}`, b?.mcuPin === e.mcuPin, JSON.stringify(b));
+        break;
+      }
+      case 'pot': {
+        const b = model.potBindings(diagram).find((x) => x.partId === e.partId);
+        check(`${t.name} : curseur → ${e.mcuPin}`, b?.mcuPin === e.mcuPin && b?.inverted === false, JSON.stringify(b));
+        break;
+      }
+      case '7seg': {
+        const [b] = model.sevenSegmentBindings(diagram);
+        const ok = b && Object.entries(e.segments).every(([seg, pin]) => b.segments[seg] === pin);
+        check(`${t.name} : 8 segments câblés`, !!ok, JSON.stringify(b?.segments));
+        break;
+      }
+      case '7seg-mux': {
+        // Afficheur multiplexé : ce n'est PAS le même binding qu'à un chiffre
+        // (`sevenSegmentBindings` écarte d'ailleurs les afficheurs à plusieurs
+        // chiffres). Un commun par chiffre remplace le COM à la masse, et c'est
+        // ce couple segments + communs que la simulation échantillonne.
+        const SEGS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'DP'];
+        const b = model.sevenSegmentMuxBindings(diagram).find((x) => x.partId === e.partId);
+        check(`${t.name} : afficheur multiplexé reconnu`, b?.digits === e.digits, JSON.stringify(b));
+        if (!b) break;
+        const segs = Object.fromEntries(SEGS.map((s, i) => [s, b.segPins[i]]));
+        const okSeg = Object.entries(e.segments).every(([seg, pin]) => segs[seg] === pin);
+        check(`${t.name} : 8 segments câblés`, okSeg, JSON.stringify(segs));
+        const okDig = e.digitPins.every((pin, i) => b.digitPins[i] === pin);
+        check(`${t.name} : ${e.digits} communs de chiffre câblés`, okDig, JSON.stringify(b.digitPins));
+        break;
+      }
+      case 'led-bar': {
+        const state = model.ledBarState(diagram, e.partId, (n) => n === e.firstPin);
+        check(`${t.name} : LED1 s'allume via ${e.firstPin}`,
+          state[0] === 1 && state.slice(1).every((v) => v === 0), JSON.stringify(state));
+        break;
+      }
+      case 'slide-switch': {
+        const bs = model.slideSwitchBindings(diagram).filter((x) => x.partId === e.partId);
+        const ok = [1, 3].every((side) => bs.find((b) => b.side === side)?.mcuPin === e.sides[side]);
+        check(`${t.name} : côtés 1 et 3 résolus`, ok, JSON.stringify(bs));
+        break;
+      }
+      case 'dip-switch': {
+        const bs = model.dipSwitchBindings(diagram).filter((x) => x.partId === e.partId);
+        check(`${t.name} : ${e.channels} canaux résolus`, bs.length === e.channels, `${bs.length} canaux`);
+        break;
+      }
+      case 'joystick': {
+        const [b] = model.joystickBindings(diagram);
+        check(`${t.name} : VERT/HORZ/SEL`, b && b.vert === e.vert && b.horz === e.horz && b.sel === e.sel,
+          JSON.stringify(b));
+        break;
+      }
+      case 'ao-do': {
+        const b = model.aoDoSensorBindings(diagram).find((x) => x.partId === e.partId);
+        check(`${t.name} : AO=${e.analog} DO=${e.digital}`,
+          b?.analogPin === e.analog && b?.digitalPin === e.digital, JSON.stringify(b));
+        break;
+      }
+      case 'digital-source': {
+        const b = model.digitalSourceBindings(diagram).find((x) => x.partId === e.partId);
+        check(`${t.name} : sortie → ${e.mcuPin}`, b?.mcuPin === e.mcuPin, JSON.stringify(b));
+        break;
+      }
+      case 'hall': {
+        // Capteur à effet Hall : au-delà du câblage de la sortie, ce qui compte
+        // est son ALIMENTATION et son rappel — la sortie est à drain ouvert,
+        // sans rappel elle ne monte jamais (le montage ne marcherait pas).
+        const b = model.hallBindings(diagram).find((x) => x.partId === e.partId);
+        check(`${t.name} : sortie → ${e.mcuPin}`, b?.mcuPin === e.mcuPin, JSON.stringify(b));
+        check(`${t.name} : alimenté (V+ et GND)`, b?.powered === e.powered, JSON.stringify(b));
+        check(`${t.name} : rappel externe ${e.pullupOhms === null ? 'absent (rappel interne)' : `${e.pullupOhms} Ω`}`,
+          b?.pullupOhms === e.pullupOhms, JSON.stringify(b));
+        break;
+      }
+      case 'open-drain': {
+        // Composant de bibliothèque à sortie collecteur ouvert (barrière optique) :
+        // même contrôle que le capteur Hall, mais le brochage vient du manifeste
+        // du paquet — et il peut demander PLUSIEURS alimentations (un barillet
+        // émetteur, un barillet récepteur).
+        const b = model.customOpenDrainBindings(diagram).find((x) => x.partId === e.partId);
+        check(`${t.name} : sortie → ${e.mcuPin}`, b?.mcuPin === e.mcuPin, JSON.stringify(b));
+        check(`${t.name} : alimenté (V+ et GND des deux boîtiers)`, b?.powered === e.powered, JSON.stringify(b));
+        check(`${t.name} : rappel externe ${e.pullupOhms === null ? 'absent (rappel interne)' : `${e.pullupOhms} Ω`}`,
+          b?.pullupOhms === e.pullupOhms, JSON.stringify(b));
+        break;
+      }
+      case 'rfid': {
+        // Lecteur de badges : c'est LUI qui parle. Ce qui compte est donc de
+        // savoir quelle broche du micro écoute quel fil — et le cavalier change
+        // la réponse : en UART le second fil ne sert pas, en Wiegand il porte
+        // les uns.
+        const b = model.customRfidBindings(diagram).find((x) => x.partId === e.partId);
+        check(`${t.name} : données → ${e.data}`, b?.data === e.data, JSON.stringify(b));
+        const attendu1 = e.data1 ?? null;
+        check(`${t.name} : ${attendu1 ? `second fil → ${attendu1}` : 'second fil inutilisé (mode UART)'}`,
+          (b?.data1 ?? null) === attendu1, JSON.stringify(b));
+        break;
+      }
+      case 'analog-source': {
+        const b = model.analogSourceBindings(diagram).find((x) => x.partId === e.partId);
+        check(`${t.name} : sortie → ${e.mcuPin}`, b?.mcuPin === e.mcuPin, JSON.stringify(b));
+        break;
+      }
+      case 'variable-resistor': {
+        // Une résistance variable nue ne « sort » rien : elle forme un pont
+        // diviseur avec une résistance fixe, et c'est le niveau de ce pont que
+        // l'entrée ADC lit. Deux points sont contrôlés — le repos (attributs de
+        // l'inspecteur) puis le curseur poussé — pour tenir la LOI de chaque
+        // composant, pas seulement son câblage.
+        const niveaux = (live) => {
+          const l = model.adcDividerLevels(diagram, live);
+          return Object.fromEntries(l.map((x) => [x.mcuPin, x.level]));
+        };
+        const compare = (attendus, vus, quoi) => {
+          for (const [pin, attendu] of Object.entries(attendus)) {
+            const vu = vus[pin];
+            check(`${t.name} : ${quoi} — pont ${pin} à ${(attendu * 100).toFixed(1)} %`,
+              typeof vu === 'number' && Math.abs(vu - attendu) < 0.002,
+              `lu ${typeof vu === 'number' ? (vu * 100).toFixed(2) + ' %' : 'aucun pont'}`);
+          }
+        };
+        compare(e.repos, niveaux(), 'repos');
+        // Curseur poussé : la LDR éclairée et la CTN chauffée descendent en
+        // résistance (le pont monte), la CTP monte (le pont descend).
+        // `null` pour tout ce qui n'est pas variable : les résistances fixes du
+        // pont gardent leur valeur (les pousser aussi effacerait la mesure).
+        // Chaque famille a sa grandeur de curseur : lux pour la LDR, degrés
+        // pour les thermistances, mW/cm² pour les composants photosensibles.
+        const grandeur = (type) => {
+          if (type === 'ldr') return e.pousse.lux;
+          if (type === 'phototransistor' || type === 'photodiode') return e.pousse.ee;
+          return e.pousse.celsius;
+        };
+        const pousse = (p) => (model.VARIABLE_RESISTOR_TYPES.has(p.type)
+          ? model.variableResistorOhms(p.type, grandeur(p.type), p.attrs)
+          : null);
+        compare(e.pousses, niveaux(pousse), 'curseur poussé');
+        break;
+      }
+      case 'servo': {
+        const b = model.servoBindings(diagram).find((x) => x.partId === e.partId);
+        check(`${t.name} : PWM → ${e.mcuPin}`, b?.mcuPin === e.mcuPin, JSON.stringify(b));
+        break;
+      }
+      case 'ultrasonic': {
+        const b = model.ultrasonicBindings(diagram).find((x) => x.partId === e.partId);
+        check(`${t.name} : TRIG=${e.trig} ECHO=${e.echo}`, b?.trig === e.trig && b?.echo === e.echo,
+          JSON.stringify(b));
+        break;
+      }
+      case 'dht22': {
+        const b = model.dht22Bindings(diagram).find((x) => x.partId === e.partId);
+        check(`${t.name} : DATA → ${e.mcuPin}`, b?.pin === e.mcuPin, JSON.stringify(b));
+        if (e.model) {
+          check(`${t.name} : modèle ${e.model}`, b?.model === e.model, JSON.stringify(b));
+        }
+        break;
+      }
+      // DS18B20 : plusieurs capteurs peuvent partager la MÊME broche — c'est
+      // tout l'intérêt du 1-Wire. La spec liste donc les couples attendus, et
+      // on vérifie aussi qu'il n'en sort ni plus ni moins.
+      case 'onewire-temp': {
+        const bs = model.ds18b20Bindings(diagram);
+        check(`${t.name} : ${e.sensors.length} capteur(s) 1-Wire résolu(s)`,
+          bs.length === e.sensors.length, JSON.stringify(bs));
+        for (const attendu of e.sensors) {
+          const b = bs.find((x) => x.partId === attendu.partId);
+          check(`${t.name} : ${attendu.partId}.Data → ${attendu.mcuPin}`,
+            b?.pin === attendu.mcuPin, JSON.stringify(b));
+        }
+        break;
+      }
+      case 'diode': {
+        // Les deux broches sont au niveau haut : seule la branche dont la diode
+        // est dans le bon sens (A → K) laisse passer le courant.
+        const haut = () => true;
+        check(`${t.name} : diode passante → LED allumée`, model.ledOn(diagram, e.ledOn, haut));
+        check(`${t.name} : diode inversée → LED éteinte`, !model.ledOn(diagram, e.ledOff, haut));
+        const circ = model.ledPowerCircuit(diagram, e.ledOn);
+        check(`${t.name} : seuil de ${e.drop} V compté dans le circuit`,
+          Math.abs((circ.diodeDrop ?? 0) - e.drop) < 1e-6, JSON.stringify(circ));
+        const bloque = model.ledPowerCircuit(diagram, e.ledOff);
+        check(`${t.name} : circuit ouvert côté diode inversée`, bloque.ohms === null, JSON.stringify(bloque));
+        break;
+      }
+      case 'capacitor': {
+        // Équivalent de Thévenin vu par l'armature chaude : c'est lui qui fixe la
+        // tension d'équilibre et la constante de temps du transitoire. Plusieurs
+        // branches RC peuvent partager la MÊME broche de commande : chacune est un
+        // nœud indépendant (un condensateur n'est pas une arête résistive, le
+        // chemin d'une branche ne peut donc pas passer par la voisine).
+        const nodes = model.capacitorNodes(diagram, e.volts, (p) => (p === e.drivePin ? e.drive : 'hiz'));
+        for (const c of e.caps) {
+          const n = nodes.find((x) => x.partId === c.partId);
+          check(`${t.name} : nœud RC ${c.partId} trouvé`, !!n, JSON.stringify(nodes));
+          if (!n) continue;
+          check(`${t.name} : ${c.partId} tension d'équilibre ${c.target} V`,
+            Math.abs(n.target - c.target) < 0.05, `cible=${n.target}`);
+          check(`${t.name} : ${c.partId} constante de temps ${c.tau} s`,
+            Math.abs(n.tau - c.tau) / c.tau < 0.05, `tau=${n.tau}`);
+          check(`${t.name} : ${c.partId} broches de mesure ${c.mcuPins.join(',')}`,
+            c.mcuPins.every((p) => n.mcuPins.includes(p)), JSON.stringify(n.mcuPins));
+        }
+        break;
+      }
+      case 'resistor-power': {
+        // Puissance dissipée par chaque résistance FIXE du schéma, et verdict :
+        // au-delà de ce que son boîtier encaisse, elle part en fumée. Le modèle
+        // ouvre la résistance et prend le générateur de Thévenin à chacune de
+        // ses pattes — la tension d'alimentation n'est jamais toute la tension
+        // à ses bornes (rails et sortie du microcontrôleur comptent aussi),
+        // d'où la marge relative plutôt qu'une égalité stricte.
+        const powers = model.resistorPowers(diagram, e.volts,
+          (p) => (p === e.drivePin ? e.drive : 'hiz'));
+        for (const r of e.resistors) {
+          const got = powers.find((x) => x.partId === r.partId);
+          check(`${t.name} : résistance ${r.partId} mesurée`, !!got, JSON.stringify(powers));
+          if (!got) continue;
+          check(`${t.name} : ${r.partId} tient ${r.rating} W`,
+            Math.abs(got.rating - r.rating) < 1e-6, `nominal=${got.rating}`);
+          check(`${t.name} : ${r.partId} dissipe ${r.watts} W`,
+            Math.abs(got.watts - r.watts) / Math.max(r.watts, 1e-3) < 0.1, `mesuré=${got.watts}`);
+          check(`${t.name} : ${r.partId} ${r.over ? 'grille' : 'tient le coup'}`,
+            got.over === r.over, `over=${got.over}`);
+        }
+        break;
+      }
+      case 'meter': {
+        // Multimètres : chaque appareil est relu par le modèle, exactement comme
+        // le fait la simulation à chaque image. `drive` fixe l'état des broches
+        // de commande (les autres restent en l'air), `tol` la marge admise — le
+        // modèle compte la résistance des rails et de la sortie du
+        // microcontrôleur, la mesure n'est donc jamais tout à fait le calcul de
+        // papier.
+        const etats = e.drive ?? {};
+        // Un montage à transistor ou à relais ne se mesure QUE ponts résolus :
+        // sans eux le circuit est ouvert et l'appareil ne lit rien. `pwm` donne
+        // en plus le rapport cyclique des broches qui hachent — un transistor
+        // commandé en PWM ne conduit qu'une fraction du temps, et ce qu'il
+        // alimente n'en reçoit que la moyenne.
+        const pwm = e.pwm ?? {};
+        const duty = (pin) => pwm[pin] ?? null;
+        model.setActiveBridges([]);
+        if (e.bridges) resolveBridges(diagram, (p) => etats[p] === 'high', e.volts, duty);
+        const lus = model.meterReadings(diagram, e.volts, (p) => etats[p] ?? 'hiz');
+        model.setActiveBridges([]); // pas de fuite d'état d'un test au suivant
+        for (const r of e.readings) {
+          const m = lus.find((x) => x.partId === r.partId);
+          check(`${t.name} : multimètre ${r.partId} trouvé`, !!m, JSON.stringify(lus));
+          if (!m) continue;
+          check(`${t.name} : ${r.partId} en ${r.mode === 'current' ? 'ampèremètre' : 'voltmètre'}`,
+            m.mode === r.mode, m.mode);
+          check(`${t.name} : ${r.partId} lit ${r.value} ${r.mode === 'current' ? 'A' : 'V'}`,
+            m.value !== null && Math.abs(m.value - r.value) < (r.tol ?? 0.05), `lu=${m.value}`);
+          check(`${t.name} : ${r.partId} sans court-circuit`, m.fault === '', m.fault);
+        }
+        break;
+      }
+      case 'fan': {
+        const vcc = catalog.isPicoBoard(t.board) ? 3.3 : 5;
+        const tourne = model.fanSpeed(model.fanCircuit(diagram, e.spins, vcc), 5, 0.85, 1);
+        check(`${t.name} : ventilateur sur l'alim tourne`,
+          tourne.speed > 0.9 && !tourne.starved, JSON.stringify(tourne));
+        const cale = model.fanSpeed(model.fanCircuit(diagram, e.starved, vcc), 5, 0.85, 1);
+        check(`${t.name} : ventilateur sur broche = courant insuffisant`,
+          cale.speed === 0 && cale.starved, JSON.stringify(cale));
+        break;
+      }
+      case 'motor': {
+        // Moteur à courant continu : l'état dépend des transistors de commande,
+        // donc des ponts — on les résout comme la simulation avant chaque frame.
+        // `spins: true` = au moins 90 % du régime nominal.
+        const vcc = catalog.isPicoBoard(t.board) ? 3.3 : 5;
+        for (const s of e.steps) {
+          const hauts = s.high ?? [];
+          const read = (p) => hauts.includes(p);
+          const etat = hauts.length ? `[${hauts.join(',')} haut]` : '[tout bas]';
+          resolveBridges(diagram, read, vcc);
+          const states = model.motorStates(diagram, vcc);
+          for (const [id, want] of Object.entries(s.motors ?? {})) {
+            const st = states.find((x) => x.partId === id);
+            const ok = !!st && Object.entries(want).every(([k, v]) =>
+              k === 'spins' ? st.speed > 0.9 === v : st[k] === v);
+            check(`${t.name} ${etat} : ${id} → ${JSON.stringify(want)}`, ok, JSON.stringify(st));
+          }
+        }
+        model.setActiveBridges([]);
+        break;
+      }
+      case 'transistor': {
+        const vcc = catalog.isPicoBoard(t.board) ? 3.3 : 5;
+        for (const s of e.steps) {
+          const hauts = s.high ?? [];
+          const read = (p) => hauts.includes(p);
+          const etat = hauts.length ? `[${hauts.join(',')} haut]` : '[tout bas]';
+          resolveBridges(diagram, read, vcc);
+          const states = model.transistorStates(diagram, read, vcc);
+          for (const [id, ic] of Object.entries(s.on ?? {})) {
+            const st = states.find((x) => x.partId === id);
+            check(`${t.name} ${etat} : ${id} conduit, Ic max ${(ic * 1000).toFixed(1)} mA`,
+              !!st && st.on && Math.abs(st.maxCollectorAmps - ic) / ic < 0.02, JSON.stringify(st));
+          }
+          for (const id of s.off ?? []) {
+            const st = states.find((x) => x.partId === id);
+            check(`${t.name} ${etat} : ${id} bloqué`, !!st && !st.on, JSON.stringify(st));
+          }
+          for (const id of s.ledOn ?? []) {
+            check(`${t.name} ${etat} : ${id} allumée`, model.ledOn(diagram, id, read));
+          }
+          for (const id of s.ledOff ?? []) {
+            check(`${t.name} ${etat} : ${id} éteinte`, !model.ledOn(diagram, id, read));
+          }
+          for (const id of s.fanSpins ?? []) {
+            const r = model.fanSpeed(model.fanCircuit(diagram, id, vcc), 5, s.fanAmps, 1);
+            check(`${t.name} ${etat} : ${id} tourne`, r.speed > 0.9 && !r.starved, JSON.stringify(r));
+          }
+          // Un darlington coûte 0,9 V de saturation (deux jonctions) : sa charge
+          // tourne, mais sous sa tension nominale. C'est le prix de son gain.
+          for (const id of s.fanSlow ?? []) {
+            const r = model.fanSpeed(model.fanCircuit(diagram, id, vcc), 5, s.fanAmps, 1);
+            check(`${t.name} ${etat} : ${id} tourne au ralenti (chute du darlington)`,
+              r.speed > 0.5 && r.speed < 0.95 && !r.starved, JSON.stringify(r));
+          }
+          for (const id of s.fanStalls ?? []) {
+            const r = model.fanSpeed(model.fanCircuit(diagram, id, vcc), 5, s.fanAmps, 1);
+            check(`${t.name} ${etat} : ${id} cale`, r.speed === 0, JSON.stringify(r));
+          }
+        }
+        model.setActiveBridges([]); // pas de fuite d'état d'un test au suivant
+        break;
+      }
+      case 'relay': {
+        const vcc = catalog.isPicoBoard(t.board) ? 3.3 : 5;
+        for (const s of e.steps) {
+          const hauts = s.high ?? [];
+          const read = (p) => hauts.includes(p);
+          const etat = hauts.length ? `[${hauts.join(',')} haut]` : '[tout bas]';
+          resolveBridges(diagram, read, vcc);
+          const states = model.relayStates(diagram, read, vcc);
+          for (const [id, want] of Object.entries(s.relays ?? {})) {
+            const st = states.find((x) => x.partId === id);
+            const ok = !!st && Object.entries(want).every(([k, v]) => st[k] === v);
+            check(`${t.name} ${etat} : ${id} → ${JSON.stringify(want)}`, ok, JSON.stringify(st));
+          }
+          for (const id of s.ledOn ?? []) {
+            check(`${t.name} ${etat} : ${id} allumée`, model.ledOn(diagram, id, read));
+          }
+          for (const id of s.ledOff ?? []) {
+            check(`${t.name} ${etat} : ${id} éteinte`, !model.ledOn(diagram, id, read));
+          }
+        }
+        model.setActiveBridges([]);
+        break;
+      }
+      case 'logic-ic': {
+        // Onze boîtiers alimentés par la carte, deux entrées communes. Chaque
+        // sortie doit valoir ce que dit la table de vérité, et ce niveau doit
+        // remonter jusqu'à la broche de lecture du microcontrôleur.
+        const vcc = catalog.isPicoBoard(t.board) ? 3.3 : 5;
+        for (const s of e.steps) {
+          const hauts = s.high ?? [];
+          const read = (p) => hauts.includes(p);
+          const etat = hauts.length ? `[${hauts.join(',')} haut]` : '[tout bas]';
+          const states = resolveLogic(diagram, read, vcc);
+          const entrees = model.logicIcMcuInputs(diagram, states);
+          for (const [id, want] of Object.entries(s.outputs ?? {})) {
+            const st = states.find((x) => x.partId === id);
+            const ok = !!st && st.fault === 'none' && st.outputs.length > 0
+              && st.outputs.every((o) => o.level === want);
+            check(`${t.name} ${etat} : ${id} sort ${want}`, ok,
+              JSON.stringify(st && { fault: st.fault, volts: st.volts, outputs: st.outputs }));
+            const pin = e.reads?.[id];
+            const lu = entrees.find((x) => x.mcuPin === pin);
+            check(`${t.name} ${etat} : ${id} lu sur ${pin}`, lu?.level === want, JSON.stringify(lu));
+          }
+        }
+        model.setActiveBridges([]);
+        model.setGateDrives([]); // pas de fuite d'état d'un test au suivant
+        break;
+      }
+      case 'keypad': {
+        const b = model.keypadBindings(diagram).find((x) => x.partId === e.partId);
+        const ok = b && e.rows.every((p, i) => b.rows[i] === p) && e.cols.every((p, i) => b.cols[i] === p);
+        check(`${t.name} : lignes/colonnes résolues`, !!ok, JSON.stringify(b));
+        break;
+      }
+      case 'neopixel': {
+        const b = model.neopixelBindings(diagram).find((x) => x.partId === e.partId);
+        check(`${t.name} : DIN → ${e.mcuPin}, ${e.count} px`,
+          b?.mcuPin === e.mcuPin && b?.count === e.count, JSON.stringify(b));
+        break;
+      }
+      case 'spi-strip': {
+        const b = model.spiStripBindings(diagram).find((x) => x.partId === e.partId);
+        check(`${t.name} : ruban SPI ${e.protocol}, ${e.count} px (DI/CI câblés)`,
+          b?.protocol === e.protocol && b?.count === e.count, JSON.stringify(b));
+        break;
+      }
+      case 'spi-device': {
+        const b = model.spiDeviceBindings(diagram).find((x) => x.partId === e.partId);
+        check(`${t.name} : D/C=${e.dcPin} CS=${e.csPin}`,
+          b?.dcPin === e.dcPin && b?.csPin === e.csPin, JSON.stringify(b));
+        break;
+      }
+      case 'i2c-part': {
+        // Les périphériques I²C sont instanciés par la présence du composant
+        // (bus global) : on vérifie le composant + son adresse/attributs.
+        const part = diagram.parts.find((p) => p.id === e.partId);
+        check(`${t.name} : composant I²C présent`, !!part && (part.attrs?.pins ?? 'i2c') === 'i2c');
+        break;
+      }
+      case 'pca9685': {
+        const b = model.pca9685Bindings(diagram).find((x) => x.partId === e.partId);
+        const ch = b?.channels.find((c) => c.ch === e.channel);
+        check(`${t.name} : canal ${e.channel} → ${e.targetId}`,
+          ch?.targetId === e.targetId, JSON.stringify(b?.channels));
+        if (e.targetPin) {
+          check(`${t.name} : canal ${e.channel} → broche ${e.targetPin}`,
+            ch?.targetPin === e.targetPin, JSON.stringify(b?.channels));
+        }
+        const p = model.pca9685PowerState(diagram).find((x) => x.partId === e.partId);
+        check(`${t.name} : alim servo ${e.powered ? 'OK' : 'absente'} (bornier V+/GND.2)`,
+          p?.ok === e.powered, JSON.stringify(p));
+        break;
+      }
+      case 'dmx': {
+        // Ligne DMX512 : le projecteur écoute la broche TX du micro (à travers
+        // la carte Grove) et prend ses canaux à partir de son adresse. La
+        // continuité du câblage est vérifiée juste après (checkNets).
+        const b = model.dmxBindings(diagram).find((x) => x.partId === e.partId);
+        check(`${t.name} : ${e.partId} écoute ${e.mcuPin}`, b?.mcuPin === e.mcuPin,
+          JSON.stringify(model.dmxBindings(diagram)));
+        check(`${t.name} : adresse ${e.address}, ${e.channels} canaux`,
+          b?.address === e.address && b?.channels === e.channels, JSON.stringify(b));
+        checkNets(t, diagram, e.nets);
+        break;
+      }
+      case 'shield': {
+        // Carte fille : elle ne simule rien, elle remplace des fils. Ce qui est
+        // branché sur ses prises doit donc se résoudre EXACTEMENT comme si le
+        // fil était piqué dans les rangées de la carte hôte.
+        const pinLed = model.ledMcuPin(diagram, e.led.partId);
+        check(`${t.name} : LED ${e.led.partId} pilotée par ${e.led.mcuPin} à travers la carte`,
+          pinLed === e.led.mcuPin, `résolu=${pinLed}`);
+        const bp = model.buttonBindings(diagram).find((x) => x.partId === e.button.partId);
+        check(`${t.name} : bouton ${e.button.partId} → ${e.button.mcuPin}`,
+          bp?.mcuPin === e.button.mcuPin, JSON.stringify(bp));
+        const i2c = diagram.parts.find((x) => x.id === e.i2c);
+        check(`${t.name} : ${e.i2c} en I²C sur la prise Grove`,
+          !!i2c && (i2c.attrs?.pins ?? 'i2c') === 'i2c');
+        checkNets(t, diagram, e.nets);
+        break;
+      }
+      case 'sonde-logique': {
+        // Analyseur logique : les voies ne se câblent pas, elles se POSENT.
+        // Ce qu'on contrôle est donc la résolution de l'accrochage par
+        // superposition de pastilles (`logicProbeVoies`) : chaque pince tombe
+        // sur la broche attendue, avec sa teinte, et les pinces mal posées
+        // sortent avec LEUR diagnostic au lieu d'être tues.
+        const voies = model.logicProbeVoies(diagram);
+        for (const v of e.voies) {
+          const got = voies.find((x) => x.partId === v.partId);
+          check(`${t.name} : ${v.partId} accrochée à ${v.pin ?? v.probleme}`,
+            (v.pin ? got?.pin === v.pin : got?.probleme === v.probleme),
+            JSON.stringify(got));
+          if (v.voie !== undefined) {
+            check(`${t.name} : ${v.partId} sur la voie ${v.voie}`,
+              got?.voie === v.voie, JSON.stringify(got));
+          }
+          if (v.etiquette !== undefined) {
+            check(`${t.name} : ${v.partId} nommée « ${v.etiquette} »`,
+              got?.etiquette === v.etiquette, JSON.stringify(got));
+          }
+        }
+        // Sans cette ligne, `samplePulses` ne balaierait pas les broches
+        // sondées et la capture resterait vide SANS rien signaler.
+        const surveillees = model.pulseMonitorPins(diagram, 5);
+        for (const v of e.voies) {
+          if (!v.pin) continue;
+          check(`${t.name} : ${v.pin} est surveillée par le moteur`,
+            surveillees.includes(v.pin), surveillees.join(','));
+        }
+        if (e.nets) checkNets(t, diagram, e.nets);
+        break;
+      }
+      case 'batterie': {
+        // La batterie ALIMENTE la carte (V+ sur une entrée d'alimentation,
+        // masses réunies) : c'est elle qui se vide de la consommation.
+        const alim = model.alimentationDeLaCarte(diagram);
+        check(`${t.name} : ${e.partId} alimente la carte par ${e.broche}`,
+          alim?.psuId === e.partId && alim?.broche === e.broche, JSON.stringify(alim));
+        // Pile de bibliothèque : sa tension pleine tombe-t-elle dans la plage de
+        // l'entrée ? Hors plage, la carte refuse de démarrer (v2026.9.7.180).
+        if (e.demarre !== undefined) {
+          const pile = diagram.parts.find((p) => p.id === e.partId);
+          const battery = pile && catalog.partDef(pile.type).custom?.battery;
+          const plage = conso.PLAGES_ENTREE[e.broche];
+          const v = battery ? conso.tensionBatterie(battery, 1) : NaN;
+          const ok = !!plage && v >= plage.min && v <= plage.max;
+          check(`${t.name} : ${e.demarre ? 'la carte démarre' : 'la carte refuse de démarrer'} (${v} V sur ${e.broche})`,
+            ok === e.demarre, JSON.stringify({ v, plage }));
+        }
+        break;
+      }
+      case 'regulateur': {
+        // Régulateur linéaire : tension de sortie lue par le modèle (marge de
+        // 2 V sur l'entrée, courant limité), avec la source réelle à l'entrée.
+        const reg = diagram.parts.find((p) => p.id === e.partId);
+        const v = reg ? model.psuOutVolts(diagram, reg) : NaN;
+        check(`${t.name} : ${e.partId} sort ${e.volts} V`, Math.abs(v - e.volts) < 0.05, `lu=${v}`);
+        break;
+      }
+      case 'nets':
+        // Continuité pure : aucun modèle de simulation derrière le composant
+        // (liaison DMX512, câblage passif).
+        checkNets(t, diagram, e.nets);
+        break;
+      default:
+        check(`${t.name} : attente inconnue`, false, e.kind);
+    }
+  } catch (err) {
+    check(`${t.name} : câblage résolu`, false, `${String(err).split('\n')[0]} — test à régénérer ?`);
+  }
+}
+console.log(`Projix : ${checks} contrôles, ${failures} échec(s).`);
+
+if (QUICK) {
+  console.log(failures === 0 ? '\nRESULTAT: OK (mode --quick)' : `\nRESULTAT: ECHEC (${failures})`);
+  process.exit(failures === 0 ? 0 : 1);
+}
+
+// --- 2. Compilation des .ino (arduino-cli via src/compiler.ts) -----------------
+const { compile, detectToolchain } = await bundle('src/compiler.ts', 'compiler.mjs');
+const tools = detectToolchain();
+const compiled = new Map(); // nom du test → payload (pour la partie e2e)
+if (!tools.arduinoCli) {
+  console.log('\nSKIP compilation .ino : arduino-cli introuvable.');
+} else {
+  const inoTests = TESTS.filter((t) => t.ext === 'ino');
+  console.log(`\n--- Compilation de ${inoTests.length} sketchs .ino (arduino-cli) ---`);
+  for (const t of inoTests) {
+    const file = testCode(t);
+    const before = failures;
+    try {
+      // compile() est ASYNCHRONE (stratégies arduino-cli enchaînées) : sans
+      // `await`, res.payload est indéfini et TOUS les .ino tombaient.
+      const res = await compile(t.board, file, ROOT);
+      compiled.set(t.name, res.payload);
+      check(`${t.name}.ino compile`, res.payload.bytes.length > 0);
+    } catch (err) {
+      check(`${t.name}.ino compile`, false, String(err).split('\n')[0]);
+    }
+    if (failures === before) console.log(`  ✓ ${t.name}.ino`);
+  }
+}
+
+// --- 3. Vérification syntaxique des .py ----------------------------------------
+// ast.parse (et non py_compile) : aucun bytecode écrit, pas de __pycache__.
+console.log('\n--- Vérification syntaxique des .py (python ast.parse) ---');
+const PY_CHECK = 'import ast, sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())';
+let pythonOk = true;
+try {
+  execFileSync('python', ['--version'], { stdio: 'ignore' });
+} catch {
+  pythonOk = false;
+  console.log('SKIP : python introuvable.');
+}
+if (pythonOk) {
+  // Les jumeaux Pico 2 partagent le programme de leur aîné : un seul contrôle
+  // par FICHIER, sinon la moitié du banc analyse deux fois les mêmes lignes.
+  const vus = new Set();
+  for (const t of TESTS.filter((x) => x.ext === 'py')) {
+    const file = testCode(t);
+    if (vus.has(file)) continue;
+    vus.add(file);
+    try {
+      execFileSync('python', ['-c', PY_CHECK, file], { stdio: ['ignore', 'pipe', 'pipe'] });
+      console.log(`  ✓ ${t.name}.py`);
+      checks++;
+    } catch (err) {
+      check(`${t.name}.py : syntaxe`, false, String(err.stderr ?? err).split('\n').slice(-3).join(' '));
+    }
+  }
+}
+
+// --- 4. Bout en bout : AVR (avr8js) puis Pico (PicoEngine + firmware) ----------
+console.log('\n--- Exécution de bout en bout ---');
+const avr8js = await import('avr8js');
+
+/** Exécute un payload AVR et compte les bascules d'une broche de port. */
+function runAvr(payload, { mega = false, port = 'B', pin = 5, cycles = 32_000_000 }) {
+  const { CPU, avrInstruction, AVRIOPort, AVRTimer, portBConfig, timer0Config, PinState } = avr8js;
+  const cpu = mega ? new CPU(Uint16Array.from(payload.bytes), 0x2200) : new CPU(Uint16Array.from(payload.bytes));
+  if (mega) cpu.pc22Bits = true;
+  const portB = new AVRIOPort(cpu, portBConfig);
+  const timerCfg = mega
+    ? { ...timer0Config, compAInterrupt: 0x2a, compBInterrupt: 0x2c, ovfInterrupt: 0x2e }
+    : timer0Config;
+  new AVRTimer(cpu, timerCfg);
+  let toggles = 0;
+  let last = PinState.Input;
+  portB.addListener(() => {
+    const s = portB.pinState(pin);
+    if (s !== last) { toggles++; last = s; }
+  });
+  for (let i = 0; i < cycles && toggles < 6; i++) {
+    avrInstruction(cpu);
+    cpu.tick();
+  }
+  return toggles;
+}
+
+if (compiled.has('blink-uno')) {
+  const toggles = runAvr(compiled.get('blink-uno'), { port: 'B', pin: 5 });
+  check('e2e blink-uno : LED D13 clignote (avr8js)', toggles >= 4, `${toggles} bascules`);
+  if (toggles >= 4) console.log(`  ✓ blink-uno : D13 clignote (${toggles} bascules)`);
+}
+if (compiled.has('blink-mega')) {
+  const toggles = runAvr(compiled.get('blink-mega'), { mega: true, port: 'B', pin: 7 });
+  check('e2e blink-mega : LED D13 clignote (avr8js)', toggles >= 4, `${toggles} bascules`);
+  if (toggles >= 4) console.log(`  ✓ blink-mega : D13 clignote (${toggles} bascules)`);
+}
+
+// Pico : vrai firmware MicroPython + script led-pico.py, LED externe sur GP15.
+const fw = firmwarePico();
+if (!fw) {
+  console.log('SKIP e2e Pico : firmware MicroPython absent (test-assets).');
+} else {
+  const { parseUf2 } = await bundle('src/shared/uf2.ts', 'uf2.mjs');
+  const { PicoEngine } = await bundle('src/webview/engines/pico.mts', 'pico.mjs');
+  const segments = parseUf2(new Uint8Array(readFileSync(fw))).map((s) => ({ addr: s.addr, data: s.data }));
+  const script = readFileSync(tk('led-pico.py'), 'utf8');
+  const engine = new PicoEngine({ kind: 'flash', segments, script });
+
+  let serial = '';
+  let gp15Toggles = 0;
+  let lastGp15 = false;
+  engine.onSerial = (chunk) => { serial += chunk; };
+  engine.onUpdate = () => {
+    const v = engine.readDigital('GP15');
+    if (v !== lastGp15) { gp15Toggles++; lastGp15 = v; }
+  };
+  console.log('e2e led-pico : démarrage de MicroPython dans le simulateur (max 120 s)…');
+  const started = Date.now();
+  engine.start();
+  await new Promise((resolve) => {
+    const timer = setInterval(() => {
+      const elapsed = (Date.now() - started) / 1000;
+      const done = gp15Toggles >= 4 && serial.includes('LED');
+      if (done || elapsed > 120) {
+        clearInterval(timer);
+        engine.dispose();
+        check('e2e led-pico : LED GP15 clignote (PicoEngine + firmware)', done,
+          `${gp15Toggles} bascules en ${elapsed.toFixed(0)} s, série=${JSON.stringify(serial.slice(-80))}`);
+        if (done) console.log(`  ✓ led-pico : GP15 clignote (${gp15Toggles} bascules en ${elapsed.toFixed(1)} s)`);
+        resolve();
+      }
+    }, 500);
+  });
+}
+
+console.log(`\n${checks} contrôles au total.`);
+console.log(failures === 0 ? 'RESULTAT: OK' : `RESULTAT: ECHEC (${failures})`);
+process.exit(failures === 0 ? 0 : 1);
