@@ -6,7 +6,9 @@
 		// Node : scripts _generate / _verify (.mjs)
 		"ghcr.io/devcontainers/features/node:1": { "version": "lts" },
 		// Python : scripts MicroPython et analyse Pylance
-		"ghcr.io/devcontainers/features/python:1": { "version": "3.12" }
+		"ghcr.io/devcontainers/features/python:1": { "version": "3.12" },
+		// SSH : accès « gh codespace ssh / logs » pour la mise au point à distance
+		"ghcr.io/devcontainers/features/sshd:1": {}
 	},
 	// arduino-cli + cœur AVR : compilation des .ino par Kablix
 	"postCreateCommand": "bash .devcontainer/post-create.sh",
